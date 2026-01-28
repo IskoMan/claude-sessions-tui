@@ -1,31 +1,59 @@
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 const DISPLAY_NAME_MAX_LEN: usize = 60;
-const BYTES_PER_KB: u64 = 1024;
 const BYTES_PER_MB: u64 = 1024 * 1024;
-const SECONDS_PER_DAY: u64 = 86400;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SortBy {
     Date,
     Size,
     Messages,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Default)]
+pub struct Config {
+    pub sort_by: Option<SortBy>,
+    pub filter_query: Option<String>,
+}
+
+impl Config {
+    fn path() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".config/claude-sessions-tui/config.json")
+    }
+
+    pub fn load() -> Self {
+        fs::read_to_string(Self::path())
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) -> io::Result<()> {
+        let p = Self::path();
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(p, serde_json::to_string_pretty(self)?)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Session {
     pub id: String,
     pub path: PathBuf,
+    pub project: String,
     pub size: u64,
-    pub message_count: usize, // Estimation or 0 if lazy loaded
+    pub message_count: usize,
     pub first_message: String,
     pub modified: SystemTime,
-    pub age_days: i64,
     pub custom_name: Option<String>,
     pub related_files: Vec<PathBuf>,
 }
@@ -35,258 +63,305 @@ impl Session {
         if self.size > BYTES_PER_MB {
             format!("{:.1}MB", self.size as f64 / BYTES_PER_MB as f64)
         } else {
-            format!("{}KB", self.size / BYTES_PER_KB)
+            format!("{}KB", self.size / 1024)
         }
     }
 
     pub fn display_name(&self) -> String {
-        if let Some(name) = &self.custom_name {
-            if !name.trim().is_empty() {
-                return name.clone();
-            }
+        if let Some(ref name) = self.custom_name {
+            if !name.trim().is_empty() { return name.clone(); }
         }
-        
-        let clean_msg = self.first_message.replace('\n', " ");
-        if clean_msg.len() > DISPLAY_NAME_MAX_LEN {
-            format!("{}...", &clean_msg[..DISPLAY_NAME_MAX_LEN])
+        let clean = self.first_message.replace('\n', " ");
+        if clean.len() > DISPLAY_NAME_MAX_LEN {
+            format!("{}...", &clean[..DISPLAY_NAME_MAX_LEN])
         } else {
-            clean_msg
+            clean
         }
     }
+
+    pub fn formatted_age(&self) -> String {
+        let elapsed = SystemTime::now().duration_since(self.modified).unwrap_or_default().as_secs();
+        if elapsed < 60 { format!("{}s", elapsed) }
+        else if elapsed < 3600 { format!("{}m", elapsed / 60) }
+        else if elapsed < 86400 { format!("{}h", elapsed / 3600) }
+        else {
+            let dt: chrono::DateTime<chrono::Local> = self.modified.into();
+            dt.format("%d %b %y").to_string()
+        }
+    }
+
+    pub fn get_todos(&self) -> Vec<String> {
+        self.related_files.iter()
+            .filter(|p| p.parent().map_or(false, |par| par.ends_with("todos")))
+            .filter_map(|p| fs::read_to_string(p).ok())
+            .filter_map(|c| serde_json::from_str::<Vec<Value>>(&c).ok())
+            .flat_map(|arr| arr)
+            .filter_map(|item| {
+                item.get("title").or_else(|| item.get("content"))
+                    .and_then(|v| v.as_str().map(String::from))
+            })
+            .collect()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct CachedMetadata {
+    custom_name: Option<String>,
+    message_count: usize,
+    first_message: String,
+    modified_ts: u64,
 }
 
 pub struct SessionManager {
     claude_root: PathBuf,
-    project_dir: PathBuf,
+    cache_file: PathBuf,
     history_file: PathBuf,
 }
 
 impl SessionManager {
     pub fn new() -> Self {
-        let home = dirs::home_dir().expect("Could not find home directory");
+        let home = dirs::home_dir().expect("Home dir not found");
         let claude_root = home.join(".claude");
-        
-        // Note: This project directory seems specific to your workspace. 
-        // In a generic tool this might need to be dynamic or configured.
-        let project_dir = claude_root.join("projects/-home-isko-workspace");
-        
         Self {
             history_file: claude_root.join("history.jsonl"),
+            cache_file: claude_root.join("sessions_tui_cache.json"),
             claude_root,
-            project_dir,
         }
     }
 
-    /// Reads ~/.claude/history.jsonl to find all session IDs and their first prompt
-    fn load_history_index(&self) -> HashMap<String, (String, SystemTime)> {
-        let mut index = HashMap::new();
-        
-        if let Ok(content) = fs::read_to_string(&self.history_file) {
-            for line in content.lines() {
-                if let Ok(val) = serde_json::from_str::<Value>(line) {
-                    if let Some(id) = val.get("sessionId").and_then(|s| s.as_str()) {
-                        // Extract prompt from "message.content"
-                        let prompt = val.get("message")
-                            .and_then(|m| m.get("content"))
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("(empty prompt)")
-                            .to_string();
-
-                        // Parse timestamp if available
-                        let time = val.get("timestamp")
-                             .and_then(|t| t.as_str())
-                             .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-                             .map(|dt| SystemTime::from(dt))
-                             .unwrap_or_else(SystemTime::now);
-
-                        // We might have multiple entries for one session. 
-                        // We typically want the "first" prompt, but the "latest" timestamp.
-                        // For simplicity, we just upsert.
-                        index.entry(id.to_string())
-                            .and_modify(|(_, t)| {
-                                if time > *t { *t = time; }
-                            })
-                            .or_insert((prompt, time));
-                    }
-                }
-            }
-        }
-        index
-    }
-
-    /// Finds all files related to this session ID (Agents, Todos, Debug, Env)
-    fn find_related_files(&self, session_id: &str) -> Vec<PathBuf> {
-        let mut files = Vec::new();
-        let debug_file = self.claude_root.join(format!("debug/{}.txt", session_id));
-        if debug_file.exists() { files.push(debug_file); }
-
-        let env_dir = self.claude_root.join(format!("session-env/{}", session_id));
-        if env_dir.exists() { files.push(env_dir); }
-
-        // Find Todos and collect linked Agents
-        // Todo format: {sessionId}-agent-{agentId}.json
-        let todo_dir = self.claude_root.join("todos");
-        if let Ok(entries) = fs::read_dir(&todo_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(session_id) {
-                    files.push(entry.path());
-
-                    // If this is a linkage to an agent, add the agent log too
-                    // name looks like: <sessId>-agent-<agentId>.json
-                    if let Some(rest) = name.strip_prefix(&format!("{}-agent-", session_id)) {
-                        if let Some(agent_id) = rest.strip_suffix(".json") {
-                            let agent_file = self.project_dir.join(format!("agent-{}.jsonl", agent_id));
-                            if agent_file.exists() {
-                                files.push(agent_file);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        files
-    }
-
-    /// Scans the actual session file for a "customTitle" field in the metadata
-    fn extract_custom_title(path: &Path) -> Option<String> {
-        // We scan specifically for a line containing "customTitle" to avoid full parse
-        // optimization: Read parsing lines as JSON
-        // Note: This matches the user request: jq -r ".customTitle // empty" | tail -n 1
-        let content = fs::read_to_string(path).ok()?;
-        let mut title = None;
-
-        for line in content.lines() {
-            if line.contains("customTitle") {
-                 if let Ok(val) = serde_json::from_str::<Value>(line) {
-                     if let Some(t) = val.get("customTitle").and_then(|s| s.as_str()) {
-                         if !t.is_empty() {
-                            title = Some(t.to_string());
-                         }
-                     }
-                 }
-            }
-        }
-        title
+    fn load_cache(&self) -> HashMap<String, CachedMetadata> {
+        fs::File::open(&self.cache_file)
+            .ok()
+            .and_then(|f| serde_json::from_reader(f).ok())
+            .unwrap_or_default()
     }
 
     pub fn load_sessions(&self) -> io::Result<Vec<Session>> {
-        let history_index = self.load_history_index();
+        let projects_dir = self.claude_root.join("projects");
+        if !projects_dir.exists() { return Ok(Vec::new()); }
+
+        let cache = self.load_cache();
+        let mut new_cache = HashMap::new();
         let mut sessions = Vec::new();
 
-        for (id, (first_prompt, mod_time)) in history_index {
-            let path = self.project_dir.join(format!("{}.jsonl", id));
-            
-            // Should we include sessions that are in history but file missing?
-            // Currently: NO, only valid matching files.
-            if !path.exists() {
-                continue;
+        for entry in fs::read_dir(projects_dir)?.flatten() {
+            if !entry.path().is_dir() { continue; }
+            let proj_name = entry.file_name().to_string_lossy().into_owned();
+
+            for file in fs::read_dir(entry.path())?.flatten() {
+                let path = file.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("jsonl") { continue; }
+                
+                let fname = path.file_stem().unwrap().to_string_lossy();
+                if fname.starts_with("agent-") { continue; }
+                let id = fname.into_owned();
+
+                let meta = fs::metadata(&path)?;
+                let mod_time = meta.modified().unwrap_or(SystemTime::now());
+                let mod_ts = mod_time.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+
+                let (custom_name, msg_count, first_msg) = if let Some(c) = cache.get(&id) {
+                    if c.modified_ts == mod_ts {
+                        new_cache.insert(id.clone(), c.clone());
+                        (c.custom_name.clone(), c.message_count, c.first_message.clone())
+                    } else {
+                        Self::scan_and_cache(&path, &id, mod_ts, &mut new_cache)
+                    }
+                } else {
+                    Self::scan_and_cache(&path, &id, mod_ts, &mut new_cache)
+                };
+
+                sessions.push(Session {
+                    id: id.clone(),
+                    path,
+                    project: proj_name.clone(),
+                    size: meta.len(),
+                    message_count: msg_count,
+                    first_message: first_msg,
+                    modified: mod_time,
+                    custom_name,
+                    related_files: self.find_related(&id, &entry.path()),
+                });
             }
-
-            let metadata = match fs::metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            
-            // Try to find custom title inside the file
-            let custom_name = Self::extract_custom_title(&path);
-
-            let age_days = SystemTime::now()
-                .duration_since(mod_time)
-                .map(|d| d.as_secs() / SECONDS_PER_DAY)
-                .unwrap_or(0) as i64;
-            
-            // Find relations
-            let related_files = self.find_related_files(&id);
-
-            sessions.push(Session {
-                id,
-                path,
-                size: metadata.len(),
-                message_count: 0, // We skip full count for speed in this new method
-                first_message: first_prompt,
-                modified: mod_time,
-                age_days,
-                custom_name,
-                related_files
-            });
         }
-
+        
+        if let Ok(f) = fs::File::create(&self.cache_file) {
+            let _ = serde_json::to_writer(f, &new_cache);
+        }
+        
         sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
         Ok(sessions)
     }
 
-    pub fn delete_session(&self, id: &str) -> io::Result<()> {
-        // 1. Re-discover related files (to be safe)
-        let related = self.find_related_files(id);
-        
-        // 2. Delete the main session file
-        let main_path = self.project_dir.join(format!("{}.jsonl", id));
-        if main_path.exists() {
-            fs::remove_file(main_path)?;
-        }
+    fn scan_and_cache(path: &Path, id: &str, ts: u64, cache: &mut HashMap<String, CachedMetadata>) -> (Option<String>, usize, String) {
+        let (title, count, first) = Self::scan_file(path).unwrap_or((None, 0, String::new()));
+        cache.insert(id.to_string(), CachedMetadata {
+            custom_name: title.clone(),
+            message_count: count,
+            first_message: first.clone(),
+            modified_ts: ts,
+        });
+        (title, count, first)
+    }
 
-        // 3. Delete all related files/directories
-        for path in related {
-            if path.is_dir() {
-                fs::remove_dir_all(&path)?;
-            } else if path.exists() {
-                fs::remove_file(&path)?;
+    fn scan_file(path: &Path) -> Option<(Option<String>, usize, String)> {
+        let content = fs::read_to_string(path).ok()?;
+        let mut count = 0;
+        let mut first = None;
+        let mut title = None;
+
+        for line in content.lines() {
+            if let Ok(val) = serde_json::from_str::<Value>(line) {
+                if let Some(t) = val.get("type").and_then(|s| s.as_str()) {
+                    if t == "user" {
+                        if val.get("isMeta").and_then(|b| b.as_bool()).unwrap_or(false) { continue; }
+                        let text = Self::extract_text(val.get("message")?.get("content")?);
+                        if text.starts_with("Caveat:") || text.starts_with("<command") || text.starts_with("<local-command") { continue; }
+                        count += 1;
+                        if first.is_none() && !text.trim().is_empty() {
+                            first = Some(text.replace('\n', " "));
+                        }
+                    }
+                }
+                if let Some(t) = val.get("customTitle").and_then(|s| s.as_str()) {
+                    if !t.is_empty() { title = Some(t.to_string()); }
+                }
             }
         }
-
-        // 4. (Optional) We do NOT remove from history.jsonl usually, 
-        // as that is a global log. But the "session" is effectively gone.
-        Ok(())
+        Some((title, count, first.unwrap_or_else(|| "(empty)".into())))
     }
 
-    pub fn rename_session(&self, id: &str, name: &str) -> io::Result<()> {
-        // With the new file-embedded customTitle, we would technically need to 
-        // append a new metadata line to the .jsonl file.
-        // For now, let's append a metadata object to the end of the file.
-        
-        let path = self.project_dir.join(format!("{}.jsonl", id));
-        if !path.exists() { return Ok(()); }
+    fn extract_text(v: &Value) -> String {
+        if let Some(s) = v.as_str() { return s.to_string(); }
+        if let Some(arr) = v.as_array() {
+            return arr.iter()
+                .filter(|i| i.get("type").and_then(|s| s.as_str()) == Some("text"))
+                .filter_map(|i| i.get("text").and_then(|s| s.as_str()))
+                .collect();
+        }
+        String::new()
+    }
 
-        let update_json = serde_json::json!({
-            "type": "rename", // Just a marker
-            "customTitle": name,
-            "timestamp": chrono::Utc::now().to_rfc3339()
+    fn find_related(&self, id: &str, proj: &Path) -> Vec<PathBuf> {
+        let mut paths = vec![
+            self.claude_root.join(format!("debug/{}.txt", id)),
+            self.claude_root.join(format!("session-env/{}", id)),
+            self.claude_root.join(format!("file-history/{}", id)),
+        ];
+        
+        if let Ok(entries) = fs::read_dir(self.claude_root.join("todos")) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with(id) {
+                    paths.push(e.path());
+                    if let Some(aid) = name.strip_prefix(&format!("{}-agent-", id)).and_then(|s| s.strip_suffix(".json")) {
+                        paths.push(proj.join(format!("agent-{}.jsonl", aid)));
+                    }
+                }
+            }
+        }
+        paths.into_iter().filter(|p| p.exists()).collect()
+    }
+
+    pub fn delete_session(&self, session: &Session) -> io::Result<Vec<String>> {
+        let mut files = session.related_files.clone();
+        if session.path.exists() { files.push(session.path.clone()); }
+
+        let mut deleted = Vec::new();
+        for p in files {
+            let name = p.strip_prefix(&self.claude_root).unwrap_or(&p).to_string_lossy().into_owned();
+            if p.is_dir() { fs::remove_dir_all(&p)?; } else { fs::remove_file(&p)?; }
+            deleted.push(name);
+        }
+
+        let mut cache = self.load_cache();
+        if cache.remove(&session.id).is_some() {
+            if let Ok(f) = fs::File::create(&self.cache_file) {
+                 let _ = serde_json::to_writer(f, &cache);
+            }
+        }
+        // Remove from history
+        self.rewrite_history(|line| {
+            serde_json::from_str::<Value>(line).ok()
+                .and_then(|v| v.get("sessionId").and_then(|s| s.as_str()).map(|s| s == session.id))
+                .unwrap_or(false)
         });
 
-        // Append to file
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .append(true)
-            .open(path)?;
-        
-        writeln!(file, "{}", update_json.to_string())?;
-
-        Ok(())
+        Ok(deleted)
     }
 
-    pub fn get_conversation_excerpt(&self, id: &str, max_messages: usize) -> io::Result<String> {
-        let path = self.project_dir.join(format!("{}.jsonl", id));
-        let content = fs::read_to_string(path)?;
+    pub fn prune_history_orphans(&self) -> usize {
+        let valid = self.get_phys_ids();
+        self.rewrite_history(|line| {
+            serde_json::from_str::<Value>(line).ok()
+                .and_then(|v| v.get("sessionId").and_then(|s| s.as_str()).map(|s| !valid.contains(s)))
+                .unwrap_or(false) // Drop if not valid
+        })
+    }
 
-        let messages: Vec<String> = content
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter_map(|value| {
-                let msg_type = value.get("type")?.as_str()?;
-                if msg_type != "user" && msg_type != "assistant" { return None; }
-                let content = value.get("message")?.get("content")?.as_str()?;
-                Some(format!("\n[{}]\n{}\n", msg_type.to_uppercase(), content))
-            })
-            .take(max_messages)
-            .collect();
-
-        if messages.is_empty() {
-            Ok("No messages found".to_string())
-        } else {
-            Ok(messages.join(""))
+    fn rewrite_history<F>(&self, should_drop: F) -> usize where F: Fn(&str) -> bool {
+        if !self.history_file.exists() { return 0; }
+        let content = fs::read_to_string(&self.history_file).unwrap_or_default();
+        let mut lines = Vec::new();
+        let mut dropped = 0;
+        for line in content.lines() {
+            if should_drop(line) { dropped += 1; } else { lines.push(line); }
         }
+        if dropped > 0 { fs::write(&self.history_file, lines.join("\n")).ok(); }
+        dropped
+    }
+
+    fn get_phys_ids(&self) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        if let Ok(projs) = fs::read_dir(self.claude_root.join("projects")) {
+            for p in projs.flatten() {
+                if let Ok(files) = fs::read_dir(p.path()) {
+                    for f in files.flatten() {
+                         let n = f.file_name().to_string_lossy().into_owned();
+                         if n.ends_with(".jsonl") && !n.starts_with("agent-") {
+                             ids.insert(n.replace(".jsonl", ""));
+                         }
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    pub fn find_orphans(&self) -> Vec<PathBuf> {
+        let valid = self.get_phys_ids();
+        let mut orphans = Vec::new();
+        
+        let mut check = |dir: &str, pred: &dyn Fn(&str) -> bool| {
+             if let Ok(entries) = fs::read_dir(self.claude_root.join(dir)) {
+                 for e in entries.flatten() {
+                     let name = e.file_name().to_string_lossy().into_owned();
+                     // Strip extension for debug
+                     let stem = Path::new(&name).file_stem().and_then(|s| s.to_str()).unwrap_or(&name);
+                     if pred(stem) { orphans.push(e.path()); }
+                 }
+             }
+        };
+
+        check("debug", &|n| !valid.contains(n) && n != "latest");
+        check("session-env", &|n| !valid.contains(n));
+        check("file-history", &|n| !valid.contains(n));
+        check("todos", &|n| !valid.iter().any(|id| n.starts_with(id)));
+
+        orphans
+    }
+
+    pub fn read_log(&self, path: &Path) -> String {
+        fs::read_to_string(path).ok()
+             .map(|c| c.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter_map(|v| {
+                    let t = v.get("type")?.as_str()?;
+                    if t != "user" && t != "assistant" { return None; }
+                    let txt = Self::extract_text(v.get("message")?.get("content")?);
+                    if txt.starts_with("Caveat:") || txt.starts_with("<command") || txt.starts_with("<local-command") { return None; }
+                    if txt.trim().is_empty() { return None; }
+                    Some(format!("\n[{}]\n{}\n", t.to_uppercase(), txt))
+                }).collect::<String>())
+             .unwrap_or_else(|| "Error reading log".into())
     }
 }
