@@ -29,7 +29,7 @@ cd claude-sessions-tui
 cargo build --release
 ```
 
-Install to `~/.local/bin`:
+Install to `~/.cargo/bin`:
 
 ```bash
 cargo install --path .
