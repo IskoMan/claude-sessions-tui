@@ -92,10 +92,10 @@ impl Session {
 
     pub fn get_todos(&self) -> Vec<String> {
         self.related_files.iter()
-            .filter(|p| p.parent().map_or(false, |par| par.ends_with("todos")))
+            .filter(|p| p.parent().is_some_and(|par| par.ends_with("todos")))
             .filter_map(|p| fs::read_to_string(p).ok())
             .filter_map(|c| serde_json::from_str::<Vec<Value>>(&c).ok())
-            .flat_map(|arr| arr)
+            .flatten()
             .filter_map(|item| {
                 item.get("title").or_else(|| item.get("content"))
                     .and_then(|v| v.as_str().map(String::from))
